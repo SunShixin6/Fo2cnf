@@ -29,7 +29,7 @@ approxmc_path = "/home/sunshixin/software/approxmc/approxmc"  # 如果approxmc�
 
 
 class CNFContext:
-    def __init__(self, file_path, n, m=2, k=2):
+    def __init__(self, file_path, n, m, k):
         self.file_path = file_path  # 输入文件路径
         path = Path(self.file_path)
         self.file_name = path.name  # 输入文件名
@@ -45,8 +45,8 @@ class CNFContext:
         self.sym_to_id: Dict[sympy.Symbol, int] = {}  # sympy符号到变量ID的映射
         self.next_var_id = 1  # 下一个可用的变量ID
         #
-        cnf_file_name = f"{os.path.splitext(self.file_name)[0]}_domain_size_{self.domain}.cnf" # 输出cnf文件名
-        clause_file_name = f"{os.path.splitext(self.file_name)[0]}_domain_size_{self.domain}.txt" # 输出子句文件名
+        cnf_file_name = f"{os.path.splitext(self.file_name)[0]}_n_{len(self.domain)}_m_{self.m}_k_{self.k}.cnf" # 输出cnf文件名
+        clause_file_name = f"{os.path.splitext(self.file_name)[0]}_n_{len(self.domain)}_m_{self.m}_k_{self.k}.txt" # 输出子句文件名
         self.cnf_path = os.path.join(self.file_dir, cnf_file_name)
         self.clause_path = os.path.join(self.file_dir, clause_file_name)
         self.clauses: list[list[int]] = []  # 存储CNF子句的列表
@@ -73,18 +73,18 @@ class CNFContext:
         e_pred = Pred('E', 2) # 边的谓词
         odd_pred = Pred('Odd', 1) # 奇数度的谓词
 
-        # 预先注册所有的 E(c1, c2) 和 Odd(c) 原子，给出现的atom分配唯一ID
+        ## 预先注册所有的 E(c1, c2) 和 Odd(c) 原子，给出现的atom分配唯一ID
         for c1, c2 in product(domain, repeat=2):
             self._register_atom(AtomicFormula(e_pred, (c1, c2), True))
         for c in domain:
             self._register_atom(AtomicFormula(odd_pred, (c,), True))
 
-        # 1. \forall X: ~E(X,X) (自反性)
+        ## 1. \forall X: ~E(X,X) (自反性)
         for c in domain:
             atom = AtomicFormula(e_pred, (c, c), True)  # E(c, c)
             self.clauses.append([-self.atom_to_id[atom]])  # 添加子句: ~E(c, c)
 
-        # 2. \forall X, Y: E(X,Y) -> E(Y,X) (对称性)
+        ## 2. \forall X, Y: E(X,Y) -> E(Y,X) (对称性)
         # 等价于: ~E(X,Y) v E(Y,X)
         for c1, c2 in combinations(domain, 2):
             atom1 = AtomicFormula(e_pred, (c1, c2), True)
@@ -95,68 +95,52 @@ class CNFContext:
             self.clauses.append([-var1, var2])
             self.clauses.append([var1, -var2])
 
-        # 3. \forall X: (Odd(X) <-> (\exists_{1 mod 2} Y: E(X, Y)))
+        ## 3. \forall X: (Odd(X) <-> (\exists_{1 mod 2} Y: E(X, Y)))
         # 对于每个X，我们使用异或（XOR）链来编码其度的奇偶性。
         for c1 in domain:
             odd_c1_var = self.atom_to_id[AtomicFormula(
-                odd_pred, (c1,), True)]  # 获取Odd(c1) 对应的变量ID
+                odd_pred, (c1,), True)]
 
-            # 获取一个列表，其中包含了所有与节点 c1 可能相连的边所对应的变量ID。例如，对于节点'0'和大小为3的域，这个列表会包含 E('0','0'), E('0','1'), E('0','2') 三个命题的ID。
-            e_c1_y_vars = [self.atom_to_id[AtomicFormula(
-                e_pred, (c1, c2), True)] for c2 in domain]
+            # 修复：只收集连接到其他不同顶点的边，这才是度的正确定义
+            degree_vars = [self.atom_to_id[AtomicFormula(e_pred, (c1, c2), True)]
+                           for c2 in domain if c1 != c2]
 
-            if not e_c1_y_vars: # 如果没有邻居，度为0（偶数），所以Odd(c1)为假
+            # 修复：根据邻居数量分别处理，确保逻辑完备
+            if not degree_vars:
+                # 没有邻居（n=1），度为0（偶数），所以Odd(c1)为假
                 self.clauses.append([-odd_c1_var])
                 continue
+            # 如果有邻居，构建XOR链
+            # current_xor_out 代表了到目前为止度变量的奇偶性
+            current_xor_out = degree_vars[0]
 
-            # 逻辑：sum(E(X,Y)) 的结果模2余1。这等价于所有 E(X,Y) 命题的异或（XOR）。例如，A XOR B XOR C 为真，当且仅当为真的命题数量是奇数。
-            """
-            对每个常量 c1，我们需要建立 Odd(c1) 和 E(c1,'0') XOR E(c1,'1') XOR E(c1,'2') ... 之间的等价关系。
-            直接将多个变量的XOR关系 (A XOR B XOR C ...) 转换为CNF在计算上是低效的。因此，代码采用了一种更聪明的方法，通过引入辅助变量将一个长的XOR链分解成一系列小的、两个输入的XOR操作。
-            """
-            current_xor_out = e_c1_y_vars[0] # 初始值是第一个边的变量。
-            for i in range(1, len(e_c1_y_vars)): # 循环遍历从第二条边开始的所有边。
-                next_var = e_c1_y_vars[i]
-                if i == len(e_c1_y_vars) - 1:
-                    # 链的最后一环直接连接到 odd_c1_var
-                    # odd_c1_var <-> current_xor_out XOR next_var
-                    # 转换为CNF:
-                    # (odd_c1_var | current_xor_out | next_var)
-                    # (odd_c1_var | -current_xor_out | -next_var)
-                    # (-odd_c1_var | -current_xor_out | next_var)
-                    # (-odd_c1_var | current_xor_out | -next_var)
-                    self.clauses.append(
-                        [odd_c1_var, current_xor_out, next_var])
-                    self.clauses.append(
-                        [odd_c1_var, -current_xor_out, -next_var])
-                    self.clauses.append(
-                        [-odd_c1_var, -current_xor_out, next_var])
-                    self.clauses.append(
-                        [-odd_c1_var, current_xor_out, -next_var])
-                else: 
-                    xor_out_new = self.next_var_id # 引入一个新的辅助变量
-                    self.next_var_id += 1
-                    """
-                    下面四句是编码： xor_out_new <-> current_xor_out XOR next_var
-                    current_xor_out 是到上一步为止的XOR结果，next_var 是当前要加入计算的边。
-                    为了方便理解，我们用 Z 代表 xor_out_new，A 代表 current_xor_out，B 代表 next_var。所以，这四行代码表达的就是：Z <-> (A XOR B)
-                    转换为CNF:
-                        (Z v A v B)
-                        (Z v ~A v ~B)
-                        (~Z v ~A v B)
-                        (~Z v A v ~B)
-                    """
-                    self.clauses.append(
-                        [xor_out_new, current_xor_out, next_var])
-                    self.clauses.append(
-                        [xor_out_new, -current_xor_out, -next_var])
-                    self.clauses.append(
-                        [-xor_out_new, -current_xor_out, next_var])
-                    self.clauses.append(
-                        [-xor_out_new, current_xor_out, -next_var])
-                    current_xor_out = xor_out_new
+            # 从第二个变量开始构建XOR链
+            for i in range(1, len(degree_vars)):
+                next_var = degree_vars[i]
+                # 为每一步的XOR结果引入一个新的辅助变量
+                xor_out_new = self.next_var_id
+                self.next_var_id += 1
 
-        # 4. \exists_{=2} X: (Odd(X))
+                # 添加子句来定义 xor_out_new <-> (current_xor_out XOR next_var)
+                # (~xor_out_new V current_xor_out V next_var)
+                self.clauses.append([-xor_out_new, current_xor_out, next_var])
+                # (~xor_out_new V ~current_xor_out V ~next_var)
+                self.clauses.append([-xor_out_new, -current_xor_out, -next_var])
+                # (xor_out_new V ~current_xor_out V next_var)
+                self.clauses.append([xor_out_new, -current_xor_out, next_var])
+                # (xor_out_new V current_xor_out V ~next_var)
+                self.clauses.append([xor_out_new, current_xor_out, -next_var])
+                
+                # 更新链的当前结果
+                current_xor_out = xor_out_new
+
+            # 在链构建完成后，将最终的XOR结果与Odd(c1)变量等同起来
+            # Odd(c1) <-> current_xor_out
+            self.clauses.append([-odd_c1_var, current_xor_out])
+            self.clauses.append([odd_c1_var, -current_xor_out])
+
+
+        ## 4. \exists_{=2} X: (Odd(X))
         # 收集所有 Odd(c) 对应的变量
         odd_vars = [self.atom_to_id[AtomicFormula(
             odd_pred, (c,), True)] for c in domain]
@@ -164,9 +148,9 @@ class CNFContext:
         card_clauses = CardEnc.equals(
             lits=odd_vars, bound=self.m, top_id=self.next_var_id - 1)
         self.clauses.extend(card_clauses.clauses)
-        self.next_var_id = card_clauses.nv + 1
+        self.next_var_id = max(self.next_var_id, card_clauses.nv + 1)
 
-        # 5. |E| = 2 (基数约束)
+        ## 5. |E| = 2 (基数约束)
         # 由于图是无向的（已通过对称性保证），我们只计算 c1 < c2 的边
         edge_vars = []
         # 按名称对域进行排序以确保一致的顺序
@@ -176,13 +160,17 @@ class CNFContext:
             atom = AtomicFormula(e_pred, (c1, c2), True)
             edge_vars.append(self.atom_to_id[atom])
 
+
         # 添加 |E| = 2 的基数约束
         logger.info(
             f"Adding cardinality constraint |E| = 2 on {len(edge_vars)} edge variables.")
-        card_clauses_e = CardEnc.equals(
-            lits=edge_vars, bound=self.k, top_id=self.next_var_id - 1)
-        self.clauses.extend(card_clauses_e.clauses)
-        self.next_var_id = card_clauses_e.nv + 1
+        if self.k > len(edge_vars):
+            self.clauses.append([])  # 不可能的约束，强制无解
+        elif edge_vars or self.k == 0:
+            card_clauses_e = CardEnc.equals(
+                lits=edge_vars, bound=self.k, top_id=self.next_var_id - 1)
+            self.clauses.extend(card_clauses_e.clauses)
+            self.next_var_id = max(self.next_var_id, card_clauses_e.nv + 1)
 
     def _register_atom(self, atom: AtomicFormula):
         """注册一个原子，如果不存在则分配新ID。"""
@@ -245,10 +233,13 @@ if __name__ == '__main__':
     logger.setLevel(logging.INFO)
 
     file_path = "/home/sunshixin/pycharm_workspace/WFOMC/models/m-odd-degree-graph-origin.wfomcs"
-    # domain = 4
-    # m = 2
-    # k = 2
-    # count =Fo2Counter(file_path, domain, k, m)
+    
+    # domain = 3
+    # m = 0
+    # k = 0
+    # count =Fo2Counter(file_path, domain, m, k)
+    # print(f"n={domain}, m={m}, k={k} -> 有效模型数量: {count}")
+    
     max_n = 5
     output_filename = "/home/sunshixin/pycharm_workspace/WFOMC/experiment/check/Fo2cnf/ganak_odd_degree/odd_degree.csv"
     with open(output_filename, "w", newline='') as f:
